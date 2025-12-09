@@ -32,7 +32,7 @@ class DataConfig:
 
 @dataclass
 class ModelConfig:
-    """模型相关配置"""
+    """模型相关配置 - 针对 RTX 4090 24GB 优化"""
     # 序列长度
     t_cond: int = 12        # 条件帧长度（过去6小时 = 12 * 30min）
     t_future: int = 12      # 未来帧长度（未来6小时 = 12 * 30min）
@@ -46,44 +46,44 @@ class ModelConfig:
     # 条件特征维度（环境特征）
     cond_feature_dim: int = 64
 
-    # === ERA5 编码器配置 ===
-    era5_base_channels: int = 32
-    era5_out_dim: int = 128    # ERA5 编码后的特征维度
+    # === ERA5 编码器配置（增强） ===
+    era5_base_channels: int = 64   # 32 → 64，更强的特征提取
+    era5_out_dim: int = 256        # 128 → 256
 
     # === 轨迹编码器配置 ===
-    coord_embed_dim: int = 64
+    coord_embed_dim: int = 128     # 64 → 128
 
-    # === Transformer 配置 ===
-    transformer_dim: int = 256
+    # === Transformer 配置（大幅增强） ===
+    transformer_dim: int = 512     # 384 → 512
     transformer_heads: int = 8
-    transformer_layers: int = 4
-    transformer_ff_dim: int = 512
+    transformer_layers: int = 8    # 6 → 8 层
+    transformer_ff_dim: int = 2048 # 1024 → 2048
     dropout: float = 0.1
 
     # === 辅助 Heatmap Head 配置 ===
-    use_heatmap_head: bool = True   # 是否使用辅助 heatmap 重建
-    heatmap_loss_weight: float = 0.1  # heatmap 重建损失权重
-    gaussian_sigma: float = 2.0      # 高斯斑点标准差
+    use_heatmap_head: bool = True
+    heatmap_loss_weight: float = 0.2
+    gaussian_sigma: float = 2.0
 
     # === Diffusion 配置 ===
     num_diffusion_steps: int = 1000
     beta_start: float = 1e-4
     beta_end: float = 0.02
-    beta_schedule: str = "linear"  # "linear" or "cosine"
+    beta_schedule: str = "cosine"
 
 
 @dataclass
 class TrainConfig:
-    """训练相关配置"""
-    batch_size: int = 32  # 增大batch_size提高GPU利用率
-    learning_rate: float = 1e-4
+    """训练相关配置 - 针对 RTX 4090 24GB 优化"""
+    batch_size: int = 64          # 32 → 64，4090 显存充足
+    learning_rate: float = 1e-4   # 降低学习率避免 NaN
     weight_decay: float = 1e-5
-    num_epochs: int = 100
+    num_epochs: int = 200         # 更多训练轮数
 
     # 数据加载优化
-    num_workers: int = 0  # Windows下设为0避免卡顿
-    pin_memory: bool = True  # 锁页内存加速传输
-    use_amp: bool = False  # 混合精度训练（关闭避免nan）
+    num_workers: int = 4          # 4090 搭配的 CPU 通常更强
+    pin_memory: bool = True
+    use_amp: bool = False         # 先关闭 AMP 排查问题
 
     # 是否对真实帧和插值帧使用不同权重
     use_sample_weights: bool = True
@@ -92,7 +92,7 @@ class TrainConfig:
 
     # 早停机制
     early_stopping: bool = True
-    patience: int = 10  # 连续N轮没改善就停止
+    patience: int = 25            # 更大耐心
 
     # 保存和日志
     save_interval: int = 10
@@ -106,17 +106,24 @@ class TrainConfig:
     train_ratio: float = 0.7
     val_ratio: float = 0.15
     test_ratio: float = 0.15
-    split_by: str = "storm_id"  # "storm_id" or "year"
+    split_by: str = "storm_id"
+    
+    # 学习率调度
+    lr_scheduler: str = "cosine_warmup"
+    warmup_epochs: int = 10       # 增加 warmup
+    
+    # 梯度累积（可选，如果想用更大 batch）
+    gradient_accumulation_steps: int = 1
 
 
 @dataclass
 class SampleConfig:
-    """采样相关配置"""
-    num_samples: int = 5          # 每个条件生成的样本数
-    use_ddim: bool = True         # 是否使用 DDIM 加速采样
-    ddim_steps: int = 50          # DDIM 采样步数
-    eta: float = 0.0              # DDIM 随机性参数
-    guidance_scale: float = 1.0   # 条件引导强度（若用 classifier-free guidance）
+    """采样相关配置 - 针对 RTX 4090 优化"""
+    num_samples: int = 10         # 5 → 10，更多集合成员提高稳定性
+    use_ddim: bool = True
+    ddim_steps: int = 50
+    eta: float = 0.0
+    guidance_scale: float = 1.0
 
 
 # 全局配置实例

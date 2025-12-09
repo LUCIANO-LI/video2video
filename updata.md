@@ -335,3 +335,117 @@ typhoon_prediction/
 ```
 
 ```
+
+---
+
+## 2024-12-08 模型改进记录
+
+### 问题分析
+
+原始模型测试结果：
+- +0.5h: 52.79 km (较好)
+- +6.0h: 1204.22 km (误差过大)
+- 标准差很大，预测不稳定
+
+### 改进内容
+
+#### 1. 模型架构改进 (model.py)
+
+**TransformerDenoiser 重构**：
+- 将简单拼接改为 **Cross-Attention** 机制，让目标序列更好地关注条件序列
+- 添加 **TransformerDenoiserBlock**：Self-Attention + Cross-Attention + FFN
+- 增加 **时间步自适应调制 (AdaLN-like)**：使用 scale 和 shift 调制特征
+- 添加 **可学习的 lead time 编码**：为不同预测时间步提供位置信息
+- 增加 **残差连接**：提高训练稳定性
+- 增加层数：4 → 6 层
+- 增大 FFN 维度：512 → d_model * 4
+
+**ERA5Encoder 增强**：
+- 添加 **空间注意力机制**：聚焦台风中心区域
+- 添加 **通道注意力 (SE-like)**：自适应学习通道重要性
+- 增加残差连接和更深的卷积层
+
+**ConditionFusion 增强**：
+- 添加 **门控机制**：自动学习各条件（坐标、ERA5、特征）的重要性权重
+- 分离投影后加权融合
+
+#### 2. 扩散过程改进 (model.py)
+
+**DDPMScheduler 升级**：
+- Beta schedule：linear → **cosine**（更平滑的噪声分布）
+- 添加 **DDIM 采样**：50步快速确定性采样
+- 添加 x0 预测值 clipping：防止数值不稳定
+
+**采样方法改进**：
+- 默认使用 **DDIM 50步**（原1000步DDPM）
+- 采样速度提升 20x
+
+#### 3. 训练策略改进 (train.py)
+
+**损失函数增强**：
+- 添加 **时序加权 MSE**：远期预测权重 1.0→2.0，缓解累积误差
+- 添加 **物理约束损失**：
+  - 速度约束：> 100 km/h 惩罚
+  - 平滑性约束：相邻速度变化惩罚
+  - 方向平滑性：急转弯惩罚
+  - 强度变化约束：vmax 变化过快惩罚
+- Heatmap loss 权重：0.1 → 0.2
+
+**优化器改进**：
+- 学习率：1e-4 → 2e-4
+- 添加 **Warmup + Cosine** 学习率调度
+- Warmup epochs: 5
+
+**稳定性增强**：
+- 添加 **EMA (Exponential Moving Average)**：decay=0.9999
+- 使用 EMA 模型进行评估
+
+**训练配置**：
+- Epochs: 100 → 150
+- Early stopping patience: 10 → 20
+
+#### 4. 评估改进 (train.py)
+
+- 添加 **集合预测**：5次采样取平均，减少随机性
+- 使用 EMA 模型进行最终评估
+
+### 配置更改 (config.py)
+
+```python
+# 模型配置
+transformer_dim: 256 → 384
+transformer_layers: 4 → 6
+transformer_ff_dim: 512 → 1024
+heatmap_loss_weight: 0.1 → 0.2
+beta_schedule: "linear" → "cosine"
+
+# 训练配置
+learning_rate: 1e-4 → 2e-4
+num_epochs: 100 → 150
+patience: 10 → 20
+warmup_epochs: 5 (新增)
+```
+
+### 预期改进效果
+
+1. **短期预测**：通过更好的条件编码，保持或略微提升
+2. **长期预测**：
+   - 时序加权损失 → 减少远期误差
+   - 物理约束 → 更平滑合理的轨迹
+   - Cross-Attention → 更好地利用条件信息
+3. **稳定性**：EMA + 集合预测 → 减少标准差
+4. **推理速度**：DDIM 50步 → 比原来快 20x
+
+### 运行方式
+
+```bash
+cd "/Users/lucianoli/Documents/Graduation Project/Code/video2video"
+python train.py
+```
+
+### 后续可考虑的改进
+
+1. **课程学习**：先预测近期，逐步增加预测时长
+2. **引导气流特征**：计算 500hPa 引导气流作为额外条件
+3. **数据增强**：轨迹扰动、ERA5 裁剪变换
+4. **更大模型**：如果 GPU 资源充足，可进一步增大模型

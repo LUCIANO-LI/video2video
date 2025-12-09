@@ -21,7 +21,7 @@ from data_processing import load_all_storms, load_tyc_storms
 
 
 class Trainer:
-    """训练器"""
+    """训练器 - 增强版"""
 
     def __init__(
         self,
@@ -46,15 +46,13 @@ class Trainer:
         self.optimizer = AdamW(
             model.parameters(),
             lr=learning_rate,
-            weight_decay=train_cfg.weight_decay
+            weight_decay=train_cfg.weight_decay,
+            betas=(0.9, 0.999)  # 标准 AdamW 参数
         )
 
-        # 学习率调度器
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer,
-            T_max=self.num_epochs,
-            eta_min=learning_rate * 0.01
-        )
+        # 学习率调度器 - 使用 Warmup + Cosine
+        self.warmup_epochs = getattr(train_cfg, 'warmup_epochs', 5)
+        self.scheduler = self._create_scheduler(learning_rate)
 
         # 日志
         self.train_losses = []
@@ -69,6 +67,42 @@ class Trainer:
         # 混合精度训练
         self.use_amp = train_cfg.use_amp and self.device == 'cuda'
         self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
+        
+        # EMA (Exponential Moving Average) 用于更稳定的预测
+        self.use_ema = True
+        self.ema_decay = 0.9999
+        self.ema_model = None
+        if self.use_ema:
+            self._init_ema()
+    
+    def _create_scheduler(self, learning_rate: float):
+        """创建带 Warmup 的 Cosine 学习率调度器"""
+        def lr_lambda(epoch):
+            if epoch < self.warmup_epochs:
+                # 线性 warmup
+                return (epoch + 1) / self.warmup_epochs
+            else:
+                # Cosine 衰减
+                progress = (epoch - self.warmup_epochs) / (self.num_epochs - self.warmup_epochs)
+                return 0.5 * (1 + np.cos(np.pi * progress))
+        
+        return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+    
+    def _init_ema(self):
+        """初始化 EMA 模型"""
+        import copy
+        self.ema_model = copy.deepcopy(self.model)
+        self.ema_model.eval()
+        for param in self.ema_model.parameters():
+            param.requires_grad = False
+    
+    def _update_ema(self):
+        """更新 EMA 模型参数"""
+        if self.ema_model is None:
+            return
+        with torch.no_grad():
+            for ema_param, param in zip(self.ema_model.parameters(), self.model.parameters()):
+                ema_param.data.mul_(self.ema_decay).add_(param.data, alpha=1 - self.ema_decay)
 
     def train_epoch(self, epoch: int) -> float:
         """训练一个 epoch"""
@@ -110,6 +144,10 @@ class Trainer:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
+            
+            # 更新 EMA
+            if self.use_ema:
+                self._update_ema()
 
             total_loss += loss.item()
             num_batches += 1
@@ -118,6 +156,8 @@ class Trainer:
             postfix = {'loss': f"{loss.item():.4f}", 'mse': f"{outputs['mse_loss'].item():.4f}"}
             if 'heatmap_loss' in outputs:
                 postfix['hm'] = f"{outputs['heatmap_loss'].item():.4f}"
+            if 'physics_loss' in outputs:
+                postfix['phy'] = f"{outputs['physics_loss'].item():.4f}"
             pbar.set_postfix(postfix)
 
         avg_loss = total_loss / num_batches
@@ -147,7 +187,7 @@ class Trainer:
         return total_loss / num_batches if num_batches > 0 else 0.0
     
     def save_checkpoint(self, epoch: int, is_best: bool = False):
-        """保存检查点 - 只保存最佳模型"""
+        """保存检查点 - 保存最佳模型和 EMA 模型"""
         if not is_best:
             return  # 只保存最佳模型
 
@@ -160,6 +200,10 @@ class Trainer:
             'val_losses': self.val_losses,
             'best_val_loss': self.best_val_loss
         }
+        
+        # 保存 EMA 模型
+        if self.use_ema and self.ema_model is not None:
+            checkpoint['ema_model_state_dict'] = self.ema_model.state_dict()
 
         # 只保存最佳模型
         torch.save(checkpoint, self.checkpoint_dir / 'best.pt')
@@ -258,8 +302,8 @@ class Trainer:
         print(f"Loss plot saved to {plot_path}")
 
 
-def evaluate_on_test(model, test_loader, device):
-    """在测试集上评估模型性能"""
+def evaluate_on_test(model, test_loader, device, use_ensemble: bool = True, num_samples: int = 5):
+    """在测试集上评估模型性能 - 支持集合预测"""
     model.eval()
 
     if len(test_loader.dataset) == 0:
@@ -271,7 +315,7 @@ def evaluate_on_test(model, test_loader, device):
     lon_range = (100, 180)
 
     with torch.no_grad():
-        for batch in test_loader:
+        for batch in tqdm(test_loader, desc="Evaluating"):
             cond_coords = batch['cond_coords'].to(device)
             cond_era5 = batch['cond_era5'].to(device)
             cond_features = batch['cond_features'].to(device)
@@ -279,8 +323,21 @@ def evaluate_on_test(model, test_loader, device):
             target_lat = batch['target_lat_raw'].numpy()
             target_lon = batch['target_lon_raw'].numpy()
 
-            # 使用sample方法进行推理预测
-            pred_delta = model.sample(cond_coords, cond_era5, cond_features).cpu().numpy()
+            # 集合预测：多次采样取平均
+            if use_ensemble and num_samples > 1:
+                all_pred_deltas = []
+                for _ in range(num_samples):
+                    pred_delta = model.sample(
+                        cond_coords, cond_era5, cond_features,
+                        num_inference_steps=50, use_ddim=True, eta=0.0
+                    ).cpu().numpy()
+                    all_pred_deltas.append(pred_delta)
+                pred_delta = np.mean(all_pred_deltas, axis=0)
+            else:
+                pred_delta = model.sample(
+                    cond_coords, cond_era5, cond_features,
+                    num_inference_steps=50, use_ddim=True, eta=0.0
+                ).cpu().numpy()
 
             # 反归一化
             last_cond = cond_coords[:, -1, :].cpu().numpy()
@@ -427,7 +484,9 @@ def main():
 
     # 5. 测试评估
     print("\n[5] Evaluating on test set...")
-    test_results = evaluate_on_test(model, test_loader, trainer.device)
+    # 使用 EMA 模型进行评估（如果有）
+    eval_model = trainer.ema_model if (trainer.use_ema and trainer.ema_model is not None) else model
+    test_results = evaluate_on_test(eval_model, test_loader, trainer.device, use_ensemble=True, num_samples=10)
 
     # 保存测试结果到config
     config["test_results"] = test_results
