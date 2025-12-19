@@ -277,6 +277,7 @@ class TransformerDenoiser(nn.Module):
             nn.LayerNorm(d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
         )
 
         # 时间步嵌入（增强）
@@ -297,14 +298,30 @@ class TransformerDenoiser(nn.Module):
         # 位置编码
         self.pos_enc = PositionalEncoding(d_model, max_len=100)
         
-        # 可学习的 lead time 编码（未来时间步位置）
+        # 可学习的 lead time 编码（未来时间步位置）- 每个时间步独立学习
         self.lead_time_embed = nn.Parameter(torch.randn(1, t_future, d_model) * 0.02)
+        
+        # 额外的 lead time MLP（增强远期时间步表示）
+        self.lead_time_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
 
         # Transformer Denoiser 块
         self.blocks = nn.ModuleList([
             TransformerDenoiserBlock(d_model, n_heads, ff_dim, dropout)
             for _ in range(n_layers)
         ])
+        
+        # 时间步感知的输出投影（每个时间步独立处理）
+        self.time_aware_proj = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
         
         # 输出投影（增强）
         self.out_proj = nn.Sequential(
@@ -328,9 +345,12 @@ class TransformerDenoiser(nn.Module):
         # 嵌入噪声增量
         x = self.delta_embed(noisy_deltas)  # (B, T_future, d_model)
         
-        # 添加位置编码 + lead time 编码
+        # 添加位置编码
         x = self.pos_enc(x)
-        x = x + self.lead_time_embed
+        
+        # 添加 lead time 编码（增强版）
+        lead_emb = self.lead_time_embed + self.lead_time_mlp(self.lead_time_embed)
+        x = x + lead_emb
         
         # 时间步嵌入
         t_emb = self.time_embed(t)  # (B, d_model)
@@ -339,12 +359,15 @@ class TransformerDenoiser(nn.Module):
         t_mlp = self.time_mlp(t_emb)  # (B, d_model * 2)
         scale, shift = t_mlp.chunk(2, dim=-1)  # 各 (B, d_model)
         # 限制 scale 范围避免数值爆炸
-        scale = torch.tanh(scale) * 0.5  # scale 在 [-0.5, 0.5]
+        scale = torch.tanh(scale) * 0.3  # scale 在 [-0.3, 0.3]，更保守
         x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
         # 通过 Transformer 块（带 Cross-Attention）
         for block in self.blocks:
             x = block(x, cond_embed)
+        
+        # 时间步感知的后处理
+        x = x + self.time_aware_proj(x)
 
         # 输出投影
         out = self.out_proj(x)  # (B, T_future, delta_dim)
@@ -678,16 +701,22 @@ class HybridDiffusionModel(nn.Module):
         target_deltas: torch.Tensor,
         target_coords: torch.Tensor = None
     ) -> Dict[str, torch.Tensor]:
-        """训练前向传播 - 增加物理约束和时序加权"""
+        """训练前向传播 - 多任务学习：噪声预测 + 坐标直接监督 + 时序一致性"""
         device = cond_coords.device
         B = cond_coords.shape[0]
+        T = target_deltas.shape[1]
         self.scheduler.to(device)
 
         # 编码条件
         cond_embed = self.encode_conditions(cond_coords, cond_era5, cond_features)
 
-        # 随机时间步
-        t = torch.randint(0, self.scheduler.num_steps, (B,), device=device)
+        # 随机时间步 - 偏向低噪声时间步以提高预测精度
+        # 使用分层采样：50%低噪声(0-300), 30%中等(300-700), 20%高噪声(700-1000)
+        rand_val = torch.rand(B, device=device)
+        t = torch.zeros(B, dtype=torch.long, device=device)
+        t[rand_val < 0.5] = torch.randint(0, 300, (int((rand_val < 0.5).sum()),), device=device)
+        t[(rand_val >= 0.5) & (rand_val < 0.8)] = torch.randint(300, 700, (int(((rand_val >= 0.5) & (rand_val < 0.8)).sum()),), device=device)
+        t[rand_val >= 0.8] = torch.randint(700, self.scheduler.num_steps, (int((rand_val >= 0.8).sum()),), device=device)
 
         # 加噪
         noisy_deltas, noise = self.scheduler.add_noise(target_deltas, t)
@@ -695,68 +724,101 @@ class HybridDiffusionModel(nn.Module):
         # 预测噪声
         noise_pred = self.denoiser(noisy_deltas, t, cond_embed)
 
-        # === 时序加权 MSE 损失 ===
-        T = target_deltas.shape[1]
-        time_weights = torch.linspace(1.0, 1.5, T, device=device).view(1, T, 1)  # 降低权重范围
-        
-        # 加权 MSE
+        # === 1. 时序加权噪声 MSE 损失 ===
+        # 远期权重指数增长：更强调远期预测
+        time_weights = torch.exp(torch.linspace(0, 0.5, T, device=device)).view(1, T, 1)  # ~1.0 → ~1.65
         mse_per_step = ((noise_pred - noise) ** 2) * time_weights
         mse_loss = mse_per_step.mean()
         
-        # 检查 NaN
         if torch.isnan(mse_loss):
             mse_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
         outputs = {
-            'loss': mse_loss,
             'mse_loss': mse_loss,
         }
 
-        # === 辅助 Heatmap 损失 ===
-        if self.use_heatmap_head and target_coords is not None:
-            # 从噪声预测恢复增量（添加数值稳定性）
+        # === 2. 坐标直接监督损失（关键改进！）===
+        if target_coords is not None:
+            # 从噪声预测恢复增量
             sqrt_alpha = self.scheduler.sqrt_alphas_cumprod[t].view(B, 1, 1)
-            sqrt_alpha = torch.clamp(sqrt_alpha, min=1e-6)  # 避免除零
+            sqrt_alpha = torch.clamp(sqrt_alpha, min=1e-6)
             sqrt_one_minus = self.scheduler.sqrt_one_minus_alphas_cumprod[t].view(B, 1, 1)
             pred_deltas = (noisy_deltas - sqrt_one_minus * noise_pred) / sqrt_alpha
-            pred_deltas = torch.clamp(pred_deltas, -10, 10)  # 限制范围
+            pred_deltas = torch.clamp(pred_deltas, -5, 5)
 
             # 计算预测坐标
             last_coord = cond_coords[:, -1:, :3]
             pred_coords = last_coord + torch.cumsum(pred_deltas, dim=1)
-            pred_coords = torch.clamp(pred_coords, 0, 1)  # 归一化坐标范围
-
-            # 归一化到网格坐标
-            pred_heatmap = self.heatmap_head(
-                pred_coords[:, :, 0] * (data_cfg.grid_height - 1),
-                pred_coords[:, :, 1] * (data_cfg.grid_width - 1)
-            )
-
-            target_heatmap = self.heatmap_head(
-                target_coords[:, :, 0] * (data_cfg.grid_height - 1),
-                target_coords[:, :, 1] * (data_cfg.grid_width - 1)
-            )
-
-            heatmap_loss = F.mse_loss(pred_heatmap, target_heatmap)
             
-            # 检查 NaN
-            if torch.isnan(heatmap_loss):
+            # 目标坐标（只取 lat, lon, vmax）
+            target_coords_3d = target_coords[:, :, :3]
+            
+            # === 坐标 L1 损失（对异常值更鲁棒）===
+            # 使用 Smooth L1 Loss，远期权重更高
+            coord_weights = torch.exp(torch.linspace(0, 1.0, T, device=device)).view(1, T, 1)  # ~1.0 → ~2.72
+            coord_diff = torch.abs(pred_coords - target_coords_3d)
+            coord_loss = (coord_diff * coord_weights).mean()
+            
+            if torch.isnan(coord_loss):
+                coord_loss = torch.tensor(0.0, device=device)
+            outputs['coord_loss'] = coord_loss
+
+            # === 3. Heatmap 损失 ===
+            if self.use_heatmap_head:
+                pred_heatmap = self.heatmap_head(
+                    torch.clamp(pred_coords[:, :, 0], 0, 1) * (data_cfg.grid_height - 1),
+                    torch.clamp(pred_coords[:, :, 1], 0, 1) * (data_cfg.grid_width - 1)
+                )
+                target_heatmap = self.heatmap_head(
+                    target_coords[:, :, 0] * (data_cfg.grid_height - 1),
+                    target_coords[:, :, 1] * (data_cfg.grid_width - 1)
+                )
+                heatmap_loss = F.mse_loss(pred_heatmap, target_heatmap)
+                
+                if torch.isnan(heatmap_loss):
+                    heatmap_loss = torch.tensor(0.0, device=device)
+                outputs['heatmap_loss'] = heatmap_loss
+            else:
                 heatmap_loss = torch.tensor(0.0, device=device)
-            
-            outputs['heatmap_loss'] = heatmap_loss
-            
-            # === 物理约束损失 ===
-            physics_loss = self._compute_physics_loss(pred_deltas, cond_coords)
-            if torch.isnan(physics_loss):
-                physics_loss = torch.tensor(0.0, device=device)
-            outputs['physics_loss'] = physics_loss
 
-            # 总损失
+            # === 4. 时序一致性损失（防止抖动）===
+            if T > 2:
+                # 二阶差分：加速度应该平滑
+                accel = torch.diff(pred_deltas, n=2, dim=1)
+                smooth_loss = (accel ** 2).mean()
+            else:
+                smooth_loss = torch.tensor(0.0, device=device)
+            
+            if torch.isnan(smooth_loss):
+                smooth_loss = torch.tensor(0.0, device=device)
+            outputs['smooth_loss'] = smooth_loss
+
+            # === 5. 方向一致性损失（台风轨迹应保持方向连续）===
+            if T > 1:
+                # 计算运动方向
+                direction = torch.atan2(pred_deltas[:, :, 1], pred_deltas[:, :, 0] + 1e-8)
+                dir_diff = torch.diff(direction, dim=1)
+                # 处理角度跳变
+                dir_diff = torch.remainder(dir_diff + math.pi, 2 * math.pi) - math.pi
+                direction_loss = (dir_diff ** 2).mean()
+            else:
+                direction_loss = torch.tensor(0.0, device=device)
+            
+            if torch.isnan(direction_loss):
+                direction_loss = torch.tensor(0.0, device=device)
+            outputs['direction_loss'] = direction_loss
+
+            # === 总损失：多任务加权 ===
+            # 关键：坐标损失权重要足够高，直接监督远期预测
             outputs['loss'] = (
-                mse_loss + 
-                model_cfg.heatmap_loss_weight * heatmap_loss +
-                0.01 * physics_loss  # 降低物理约束权重到 0.01
+                mse_loss * 1.0 +                    # 噪声预测
+                coord_loss * 0.5 +                  # 坐标直接监督（关键！）
+                heatmap_loss * model_cfg.heatmap_loss_weight +  # Heatmap
+                smooth_loss * 0.1 +                 # 平滑性
+                direction_loss * 0.05              # 方向一致性
             )
+        else:
+            outputs['loss'] = mse_loss
 
         return outputs
     
@@ -793,12 +855,13 @@ class HybridDiffusionModel(nn.Module):
         cond_features: torch.Tensor,
         num_inference_steps: int = None,
         use_ddim: bool = True,
-        eta: float = 0.0
+        eta: float = 0.0,
+        use_refinement: bool = False  # 默认关闭精细化，避免数值问题
     ) -> torch.Tensor:
         """采样生成 - 支持 DDIM 加速"""
         device = cond_coords.device
         B = cond_coords.shape[0]
-        num_inference_steps = num_inference_steps or 50  # 默认使用 50 步 DDIM
+        num_inference_steps = num_inference_steps or 50
         self.scheduler.to(device)
 
         # 编码条件
@@ -808,8 +871,7 @@ class HybridDiffusionModel(nn.Module):
         x = torch.randn(B, self.t_future, self.delta_dim, device=device)
 
         if use_ddim:
-            # DDIM 采样 - 更快更稳定
-            # 创建时间步序列（均匀间隔）
+            # DDIM 采样 - 均匀时间步
             step_ratio = self.scheduler.num_steps // num_inference_steps
             timesteps = torch.arange(0, self.scheduler.num_steps, step_ratio, device=device)
             timesteps = torch.flip(timesteps, [0])  # 从大到小

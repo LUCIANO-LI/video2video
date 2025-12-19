@@ -31,7 +31,7 @@ def load_model_and_data():
     
     # 加载模型
     print('\nLoading best model...')
-    checkpoint = torch.load('checkpoints/best.pt', map_location='cuda')
+    checkpoint = torch.load('checkpoints/best.pt', map_location='cuda', weights_only=False)
     sample = test_ds[0]
     era5_channels = sample['cond_era5'].shape[1]
     feature_dim = sample['cond_features'].shape[-1]

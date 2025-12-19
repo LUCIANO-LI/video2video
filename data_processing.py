@@ -319,8 +319,11 @@ def load_single_tyc_storm(
     lon_grid = None
 
     if era5_folder.exists():
-        # 获取所有NC文件并按时间排序
+        # 获取所有NC文件并按时间排序（支持两种命名格式）
         nc_files = sorted(glob.glob(str(era5_folder / "era5_merged_*_fused.nc")))
+        if not nc_files:
+            # 尝试新格式
+            nc_files = sorted(glob.glob(str(era5_folder / "era5_merged_*.nc")))
 
         if nc_files:
             # 解析NC文件时间，并与轨迹时间对齐
@@ -408,11 +411,27 @@ def load_single_tyc_storm(
 def parse_nc_filename_time(nc_path: str) -> Optional[pd.Timestamp]:
     """从NC文件名解析时间
 
-    格式: era5_merged_{YYYYMMDD}_{YYYYMMDD}_{HHMM}_fused.nc
-    例如: era5_merged_19500725_19500725_1430_fused.nc -> 1950-07-25 14:30
+    支持两种格式:
+    1. 旧格式: era5_merged_{YYYYMMDD}_{YYYYMMDD}_{HHMM}_fused.nc
+       例如: era5_merged_19500725_19500725_1430_fused.nc -> 1950-07-25 14:30
+    2. 新格式: era5_merged_{YYYYMMDDHH}_{storm_id}.nc
+       例如: era5_merged_1950050600_1950126N09151.nc -> 1950-05-06 00:00
     """
     filename = Path(nc_path).name
     try:
+        # 尝试新格式: era5_merged_{YYYYMMDDHH}_{storm_id}.nc
+        if '_fused.nc' not in filename:
+            parts = filename.replace('era5_merged_', '').replace('.nc', '').split('_')
+            if len(parts) >= 1:
+                datetime_str = parts[0]  # YYYYMMDDHH
+                if len(datetime_str) >= 10:
+                    year = int(datetime_str[:4])
+                    month = int(datetime_str[4:6])
+                    day = int(datetime_str[6:8])
+                    hour = int(datetime_str[8:10])
+                    return pd.Timestamp(year=year, month=month, day=day, hour=hour)
+        
+        # 尝试旧格式: era5_merged_{YYYYMMDD}_{YYYYMMDD}_{HHMM}_fused.nc
         parts = filename.replace('era5_merged_', '').replace('_fused.nc', '').split('_')
         if len(parts) >= 3:
             date_str = parts[0]  # YYYYMMDD

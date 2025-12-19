@@ -154,10 +154,12 @@ class Trainer:
 
             # 更新进度条
             postfix = {'loss': f"{loss.item():.4f}", 'mse': f"{outputs['mse_loss'].item():.4f}"}
+            if 'coord_loss' in outputs:
+                postfix['coord'] = f"{outputs['coord_loss'].item():.4f}"
             if 'heatmap_loss' in outputs:
                 postfix['hm'] = f"{outputs['heatmap_loss'].item():.4f}"
-            if 'physics_loss' in outputs:
-                postfix['phy'] = f"{outputs['physics_loss'].item():.4f}"
+            if 'smooth_loss' in outputs:
+                postfix['sm'] = f"{outputs['smooth_loss'].item():.4f}"
             pbar.set_postfix(postfix)
 
         avg_loss = total_loss / num_batches
@@ -211,7 +213,7 @@ class Trainer:
     
     def load_checkpoint(self, path: str):
         """加载检查点"""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -302,8 +304,8 @@ class Trainer:
         print(f"Loss plot saved to {plot_path}")
 
 
-def evaluate_on_test(model, test_loader, device, use_ensemble: bool = True, num_samples: int = 5):
-    """在测试集上评估模型性能 - 支持集合预测"""
+def evaluate_on_test(model, test_loader, device, use_ensemble: bool = True, num_samples: int = 10):
+    """在测试集上评估模型性能 - 集合预测"""
     model.eval()
 
     if len(test_loader.dataset) == 0:
@@ -326,12 +328,14 @@ def evaluate_on_test(model, test_loader, device, use_ensemble: bool = True, num_
             # 集合预测：多次采样取平均
             if use_ensemble and num_samples > 1:
                 all_pred_deltas = []
-                for _ in range(num_samples):
+                for i in range(num_samples):
                     pred_delta = model.sample(
                         cond_coords, cond_era5, cond_features,
                         num_inference_steps=50, use_ddim=True, eta=0.0
                     ).cpu().numpy()
                     all_pred_deltas.append(pred_delta)
+                
+                # 简单平均
                 pred_delta = np.mean(all_pred_deltas, axis=0)
             else:
                 pred_delta = model.sample(

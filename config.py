@@ -62,7 +62,7 @@ class ModelConfig:
 
     # === 辅助 Heatmap Head 配置 ===
     use_heatmap_head: bool = True
-    heatmap_loss_weight: float = 0.2
+    heatmap_loss_weight: float = 0.3   # 0.2 → 0.3，增强空间监督
     gaussian_sigma: float = 2.0
 
     # === Diffusion 配置 ===
@@ -75,13 +75,13 @@ class ModelConfig:
 @dataclass
 class TrainConfig:
     """训练相关配置 - 针对 RTX 4090 24GB 优化"""
-    batch_size: int = 64          # 32 → 64，4090 显存充足
-    learning_rate: float = 1e-4   # 降低学习率避免 NaN
+    batch_size: int = 64          # 恢复为 64
+    learning_rate: float = 1e-4   # 恢复为 1e-4，更快收敛
     weight_decay: float = 1e-5
-    num_epochs: int = 200         # 更多训练轮数
+    num_epochs: int = 200         # 恢复为 200
 
     # 数据加载优化
-    num_workers: int = 4          # 4090 搭配的 CPU 通常更强
+    num_workers: int = 0          # Windows 上必须设为 0 避免 multiprocessing 问题
     pin_memory: bool = True
     use_amp: bool = False         # 先关闭 AMP 排查问题
 
@@ -92,7 +92,7 @@ class TrainConfig:
 
     # 早停机制
     early_stopping: bool = True
-    patience: int = 25            # 更大耐心
+    patience: int = 25            # 恢复为 25
 
     # 保存和日志
     save_interval: int = 10
@@ -110,18 +110,18 @@ class TrainConfig:
     
     # 学习率调度
     lr_scheduler: str = "cosine_warmup"
-    warmup_epochs: int = 10       # 增加 warmup
+    warmup_epochs: int = 10       # 恢复为 10
     
-    # 梯度累积（可选，如果想用更大 batch）
-    gradient_accumulation_steps: int = 1
+    # 梯度累积
+    gradient_accumulation_steps: int = 1  # 恢复为 1
 
 
 @dataclass
 class SampleConfig:
     """采样相关配置 - 针对 RTX 4090 优化"""
-    num_samples: int = 10         # 5 → 10，更多集合成员提高稳定性
+    num_samples: int = 10         # 恢复为 10
     use_ddim: bool = True
-    ddim_steps: int = 50
+    ddim_steps: int = 50          # 恢复为 50
     eta: float = 0.0
     guidance_scale: float = 1.0
 
